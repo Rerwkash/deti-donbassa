@@ -1,0 +1,15 @@
+.env
+.next
+node_modules
+dist
+coverage
+*.log
+tsconfig.tsbuildinfo
+tsconfig.typecheck.tsbuildinfo
+data/*.json
+data/*.ics
+!data/.gitkeep
+__pycache__/
+*.pyc
+
+.vercel

@@ -1,0 +1,22 @@
+{
+  "name": "deti-donbassa",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json"
+  },
+  "dependencies": {
+    "next": "15.5.12",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.14.1",
+    "@types/react": "19.0.12",
+    "typescript": "5.8.2"
+  }
+}
