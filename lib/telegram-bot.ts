@@ -1,7 +1,8 @@
 import { env } from "@/lib/env";
 import { refreshGoogleToken, replaceGoogleWaterEvents } from "@/lib/google";
 import { refreshMicrosoftToken, replaceWaterEvents } from "@/lib/microsoft";
-import { getUser, upsertUser } from "@/lib/storage";
+import { addPublicNewsSource, normalizeTelegramChannelInput, processPublicNews } from "@/lib/news";
+import { getUser, listNewsSources, removeNewsSource, upsertUser } from "@/lib/storage";
 import { answerCallbackQuery, sendTelegramMessage } from "@/lib/telegram";
 import { BotState, GoogleToken, MicrosoftToken, TelegramUpdate, UserRecord } from "@/lib/types";
 import {
@@ -20,6 +21,7 @@ const BUTTONS = {
   loginMicrosoft: "Подключить Microsoft",
   loginGoogle: "Подключить Google",
   setupWater: "Настроить воду",
+  setupNews: "Настройка новостей",
   status: "Статус",
   sync: "Синхронизировать",
   reportStart: "Вода пошла",
@@ -57,7 +59,7 @@ function mainMenuKeyboard() {
     keyboard: [
       [{ text: BUTTONS.sync }, { text: BUTTONS.status }],
       [{ text: BUTTONS.loginMicrosoft }, { text: BUTTONS.loginGoogle }],
-      [{ text: BUTTONS.setupWater }],
+      [{ text: BUTTONS.setupWater }, { text: BUTTONS.setupNews }],
       [{ text: BUTTONS.reportStart }, { text: BUTTONS.reportEnd }],
       [{ text: BUTTONS.help }],
     ],
@@ -109,6 +111,27 @@ function reportButtons(date: string) {
         { text: "Отметить конец", callback_data: `report_end:${date}` },
       ],
     ]),
+  };
+}
+
+function newsSettingsButtons() {
+  return {
+    inline_keyboard: addCancelButton([
+      [{ text: "Просмотр списка источников", callback_data: "news_list" }],
+      [
+        { text: "Добавить", callback_data: "news_add_prompt" },
+        { text: "Удалить", callback_data: "news_remove_menu" },
+      ],
+      [{ text: "Проверить сейчас", callback_data: "news_check" }],
+    ]),
+  };
+}
+
+function newsRemoveButtons(items: Array<{ title: string; channelSlug: string }>) {
+  return {
+    inline_keyboard: addCancelButton(
+      items.map((item) => [{ text: item.title, callback_data: `news_delete:${item.channelSlug}` }]),
+    ),
   };
 }
 
@@ -425,6 +448,34 @@ async function startWaterSetup(chatId: string) {
   await sendInlineMessage(chatId, "Выбери месяц первой даты подачи воды.", monthButtons());
 }
 
+async function showNewsSettings(chatId: string) {
+  await clearBotState(chatId);
+  await sendInlineMessage(
+    chatId,
+    [
+      "Настройка новостей.",
+      "",
+      "Здесь можно посмотреть список источников, добавить новый публичный канал или удалить старый.",
+    ].join("\n"),
+    newsSettingsButtons(),
+  );
+}
+
+async function promptNewsSourceInput(chatId: string) {
+  await upsertUser(chatId, (current) => ({
+    ...current,
+    botState: {
+      flow: "news_setup",
+      step: "enter_news_source",
+    },
+  }));
+
+  await sendCancelablePrompt(
+    chatId,
+    ["Пришли ссылку на публичный Telegram-канал.", "Пример: https://t.me/durov"].join("\n"),
+  );
+}
+
 async function promptDayInput(chatId: string, month: number) {
   await upsertUser(chatId, (current) => ({
     ...current,
@@ -529,6 +580,26 @@ async function handlePendingDay(chatId: string, state: BotState, text: string): 
   return true;
 }
 
+async function handlePendingNewsSource(chatId: string, user: UserRecord, text: string): Promise<boolean> {
+  const state = user.botState;
+  if (state?.flow !== "news_setup" || state.step !== "enter_news_source") {
+    return false;
+  }
+
+  try {
+    const result = await addPublicNewsSource(chatId, text);
+    await clearBotState(chatId);
+    await sendMenuMessage(chatId, result);
+  } catch (error) {
+    await sendCancelablePrompt(
+      chatId,
+      error instanceof Error ? error.message : "Не удалось добавить источник. Пришли ссылку еще раз.",
+    );
+  }
+
+  return true;
+}
+
 async function handlePendingTime(chatId: string, user: UserRecord, text: string): Promise<boolean> {
   const state = user.botState;
   if (!state?.flow || state.step !== "enter_time" || (state.flow !== "report_start" && state.flow !== "report_end")) {
@@ -607,6 +678,10 @@ function normalizeAction(text: string): string {
     return "setup_water";
   }
 
+  if (trimmed === BUTTONS.setupNews) {
+    return "setup_news";
+  }
+
   if (trimmed === BUTTONS.help) {
     return "help";
   }
@@ -620,6 +695,81 @@ function normalizeAction(text: string): string {
   }
 
   return trimmed;
+}
+
+function commandPayload(text: string, command: string): string | null {
+  const match = text.match(new RegExp(`^/${command}(?:@\\w+)?(?:\\s+([\\s\\S]+))?$`, "i"));
+  if (!match) {
+    return null;
+  }
+
+  return match[1]?.trim() ?? "";
+}
+
+async function formatNewsSourcesMessage(chatId: string): Promise<string> {
+  const sources = await listNewsSources(chatId);
+
+  if (sources.length === 0) {
+    return [
+      "Источников новостей пока нет.",
+      "Добавь публичный канал так:",
+      "/news_add https://t.me/durov",
+    ].join("\n");
+  }
+
+  return [
+    "Источники новостей:",
+    ...sources.map((source, index) =>
+      [
+        `${index + 1}. ${source.title ?? `@${source.channelSlug}`}`,
+        source.url,
+        `Последний пост: ${source.lastPostId ?? "пока нет"}`,
+        `Проверка: ${formatStatusHumanDateTime(source.lastCheckedAt)}`,
+      ].join("\n"),
+    ),
+  ].join("\n\n");
+}
+
+async function checkNewsNow(chatId: string): Promise<string> {
+  const result = await processPublicNews(chatId);
+
+  if (result.checked === 0) {
+    return [
+      "Сначала добавь хотя бы один публичный Telegram-канал.",
+      "Пример: /news_add https://t.me/durov",
+    ].join("\n");
+  }
+
+  if (result.newPosts === 0) {
+    return `Проверка завершена.\nИсточников проверено: ${result.checked}\nНовых постов нет.`;
+  }
+
+  return [
+    "Проверка завершена.",
+    `Источников проверено: ${result.checked}`,
+    `Новых постов: ${result.newPosts}`,
+    `Сообщений отправлено: ${result.deliveries}`,
+  ].join("\n");
+}
+
+async function showNewsRemoveMenu(chatId: string) {
+  const sources = await listNewsSources(chatId);
+
+  if (sources.length === 0) {
+    await sendInlineMessage(chatId, "Источников пока нет. Сначала добавь хотя бы один канал.", cancelButtons());
+    return;
+  }
+
+  await sendInlineMessage(
+    chatId,
+    "Выбери источник, который нужно удалить.",
+    newsRemoveButtons(
+      sources.map((source) => ({
+        title: source.title ?? `@${source.channelSlug}`,
+        channelSlug: source.channelSlug,
+      })),
+    ),
+  );
 }
 
 async function handleCallbackQuery(update: TelegramUpdate): Promise<boolean> {
@@ -649,6 +799,33 @@ async function handleCallbackQuery(update: TelegramUpdate): Promise<boolean> {
 
   if (callback.data === "action_login") {
     await sendLoginMessage(chatId);
+    return true;
+  }
+
+  if (callback.data === "news_list") {
+    await sendMenuMessage(chatId, await formatNewsSourcesMessage(chatId));
+    return true;
+  }
+
+  if (callback.data === "news_add_prompt") {
+    await promptNewsSourceInput(chatId);
+    return true;
+  }
+
+  if (callback.data === "news_remove_menu") {
+    await showNewsRemoveMenu(chatId);
+    return true;
+  }
+
+  if (callback.data === "news_check") {
+    await sendMenuMessage(chatId, await checkNewsNow(chatId));
+    return true;
+  }
+
+  if (callback.data.startsWith("news_delete:")) {
+    const channelSlug = callback.data.split(":")[1];
+    await removeNewsSource(chatId, channelSlug);
+    await sendMenuMessage(chatId, `Источник удален: @${channelSlug}`);
     return true;
   }
 
@@ -702,7 +879,53 @@ export async function handleTelegramUpdate(update: TelegramUpdate): Promise<void
     return;
   }
 
+  if (user && (await handlePendingNewsSource(chatId, user, rawText))) {
+    return;
+  }
+
   if (user && (await handlePendingTime(chatId, user, rawText))) {
+    return;
+  }
+
+  const newsAdd = commandPayload(rawText, "news_add");
+  if (newsAdd !== null) {
+    if (!newsAdd) {
+      await sendMenuMessage(chatId, "Пришли ссылку на публичный канал.\nПример: /news_add https://t.me/durov");
+      return;
+    }
+
+    try {
+      await sendMenuMessage(chatId, await addPublicNewsSource(chatId, newsAdd));
+    } catch (error) {
+      await sendMenuMessage(chatId, error instanceof Error ? error.message : "Не удалось добавить канал.");
+    }
+    return;
+  }
+
+  const newsRemove = commandPayload(rawText, "news_remove");
+  if (newsRemove !== null) {
+    if (!newsRemove) {
+      await sendMenuMessage(chatId, "Пришли username или ссылку.\nПример: /news_remove https://t.me/durov");
+      return;
+    }
+
+    try {
+      const normalized = normalizeTelegramChannelInput(newsRemove);
+      await removeNewsSource(chatId, normalized.channelSlug);
+      await sendMenuMessage(chatId, `Источник удален: @${normalized.channelSlug}`);
+    } catch (error) {
+      await sendMenuMessage(chatId, error instanceof Error ? error.message : "Не удалось удалить источник.");
+    }
+    return;
+  }
+
+  if (/^\/news_list(?:@\w+)?$/i.test(rawText)) {
+    await sendMenuMessage(chatId, await formatNewsSourcesMessage(chatId));
+    return;
+  }
+
+  if (/^\/news_check(?:@\w+)?$/i.test(rawText)) {
+    await sendMenuMessage(chatId, await checkNewsNow(chatId));
     return;
   }
 
@@ -719,6 +942,7 @@ export async function handleTelegramUpdate(update: TelegramUpdate): Promise<void
         "2. Настроить дату воды через выбор месяца и дня.",
         "3. Отмечать, когда вода реально пошла и закончилась.",
         "4. Синхронизировать оба календаря.",
+        "5. Настраивать новости через кнопку «Настройка новостей».",
       ].join("\n"),
     );
     return;
@@ -731,6 +955,11 @@ export async function handleTelegramUpdate(update: TelegramUpdate): Promise<void
 
   if (text === "setup_water") {
     await startWaterSetup(chatId);
+    return;
+  }
+
+  if (text === "setup_news") {
+    await showNewsSettings(chatId);
     return;
   }
 
@@ -764,6 +993,7 @@ export async function handleTelegramUpdate(update: TelegramUpdate): Promise<void
         "3. Отправь день месяца числом.",
         "4. Выбери периодичность кнопкой.",
         "5. В день воды отмечай «Вода пошла» и «Вода закончилась».",
+        "6. В «Настройка новостей» можно смотреть, добавлять и удалять источники.",
         "Во время редактирования можно нажать «Отмена».",
       ].join("\n"),
     );

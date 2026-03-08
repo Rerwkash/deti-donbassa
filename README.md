@@ -7,6 +7,7 @@ Telegram bot on `Vercel` that:
 - configures water supply by buttons;
 - syncs water events to both calendars;
 - sends reminders on water days and at expected start/end times;
+- watches public Telegram channels by link without a local PC agent;
 - stores state in `Supabase`.
 
 ## Main Flow
@@ -19,6 +20,7 @@ Telegram bot on `Vercel` that:
 6. Choose interval days with buttons.
 7. Press `Синхронизировать`.
 8. On water day, use `Вода пошла` and `Вода закончилась` so the bot learns approximate times.
+9. Add public Telegram channels with `/news_add https://t.me/channelname`.
 
 ## Environment Variables
 
@@ -69,6 +71,11 @@ If you already created the table earlier, run the new migration additions too:
 alter table public.bot_users add column if not exists google jsonb;
 alter table public.bot_users add column if not exists bot_state jsonb;
 alter table public.bot_users add column if not exists notification_state jsonb;
+alter table public.news_sources add column if not exists title text;
+alter table public.news_sources add column if not exists last_post_id bigint;
+alter table public.news_sources add column if not exists last_checked_at timestamptz;
+alter table public.news_sources add column if not exists enabled boolean not null default true;
+alter table public.news_sources add column if not exists created_at timestamptz not null default now();
 ```
 
 ## External Alerts Cron
@@ -82,3 +89,28 @@ https://deti-donbassa.vercel.app/api/cron/water-alerts?token=<CRON_SECRET>
 ```
 
 The external cron only wakes the app up. The bot itself decides whether it should send a message right now.
+
+## Public Telegram Channels
+
+The bot can track only public channels with usernames.
+
+Commands:
+
+```text
+/news_add https://t.me/durov
+/news_list
+/news_check
+/news_remove https://t.me/durov
+```
+
+For automatic checks call this URL from `cron-job.org` every 5-10 minutes:
+
+```text
+https://deti-donbassa.vercel.app/api/cron/news-poll?token=<CRON_SECRET>
+```
+
+Notes:
+
+- private invite links are not supported in this mode;
+- the bot reads public `t.me/s/...` pages, so parsing can break if Telegram changes the page markup;
+- when a source is added, existing posts are skipped and only future posts are sent.

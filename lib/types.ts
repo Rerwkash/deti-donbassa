@@ -35,9 +35,34 @@ export type UserRecord = {
   lastSyncAt?: string;
 };
 
+export type NewsSourceRecord = {
+  id: number;
+  telegramId: string;
+  url: string;
+  channelSlug: string;
+  title?: string;
+  lastPostId?: number;
+  lastCheckedAt?: string;
+  enabled: boolean;
+  createdAt?: string;
+};
+
+export type ScrapedNewsPost = {
+  postId: number;
+  postUrl: string;
+  publishedAt?: string;
+  text: string;
+  media: ScrapedNewsMedia[];
+};
+
+export type ScrapedNewsMedia = {
+  type: "photo" | "video";
+  url: string;
+};
+
 export type BotState = {
-  flow?: "water_setup" | "report_start" | "report_end";
-  step?: "choose_month" | "enter_day" | "choose_interval" | "enter_time";
+  flow?: "water_setup" | "report_start" | "report_end" | "news_setup";
+  step?: "choose_month" | "enter_day" | "choose_interval" | "enter_time" | "enter_news_source";
   draftMonth?: number;
   draftDay?: number;
   reportDate?: string;
