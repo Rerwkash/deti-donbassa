@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 
 import { env } from "@/lib/env";
 import { handleTelegramUpdate } from "@/lib/telegram-bot";
@@ -10,6 +10,13 @@ export async function POST(request: Request) {
   }
 
   const update = await request.json();
-  await handleTelegramUpdate(update);
+  after(async () => {
+    try {
+      await handleTelegramUpdate(update);
+    } catch (error) {
+      console.error("Telegram webhook processing failed", error);
+    }
+  });
+
   return NextResponse.json({ ok: true });
 }

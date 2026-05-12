@@ -1,9 +1,69 @@
-import { listActiveNewsSources, updateNewsSource, upsertNewsSource, upsertUser } from "@/lib/storage";
+import { Api, TelegramClient } from "telegram";
+
+import { hasWaterIncidentSignal, recordIncidentFromNewsPost } from "@/lib/incidents";
+import { getUser, listActiveNewsSources, updateNewsSource, upsertNewsSource, upsertUser } from "@/lib/storage";
 import { sendTelegramMediaGroup, sendTelegramMessage, sendTelegramPhoto, sendTelegramVideo } from "@/lib/telegram";
-import { NewsSourceRecord, ScrapedNewsMedia, ScrapedNewsPost } from "@/lib/types";
+import { withTelegramAccountClient } from "@/lib/telegram-user";
+import { NewsSourceRecord, NewsSourceSuggestion, ScrapedNewsMedia, ScrapedNewsPost, TelegramAccountToken } from "@/lib/types";
 
 const TELEGRAM_HOSTS = new Set(["t.me", "www.t.me", "telegram.me", "www.telegram.me"]);
 const NEWS_TIMEZONE = "Europe/Moscow";
+const SEARCH_LIMIT = 8;
+const FETCH_LIMIT = 30;
+
+function moscowDayKey(date: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: NEWS_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function isPublishedWithinMoscowRange(publishedAt: string | undefined, start: Date, end: Date): boolean {
+  if (!publishedAt) {
+    return false;
+  }
+
+  const parsed = new Date(publishedAt);
+  if (Number.isNaN(parsed.getTime())) {
+    return false;
+  }
+
+  const startKey = moscowDayKey(start);
+  const endKey = moscowDayKey(end);
+  const publishedKey = moscowDayKey(parsed);
+  return publishedKey >= startKey && publishedKey <= endKey;
+}
+
+function rangeFetchLimit(start: Date, end: Date): number {
+  const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / 86_400_000));
+  return Math.max(200, Math.min(2000, days * 250));
+}
+
+function isTelegramChannelEntity(entity: unknown): entity is Api.Channel {
+  return entity instanceof Api.Channel && Boolean(entity.username);
+}
+
+function telegramEntityKind(entity: Api.Channel): "channel" | "group" {
+  return entity.broadcast ? "channel" : "group";
+}
+
+function telegramEntityTitle(entity: Api.Channel): string {
+  return entity.title?.trim() || `@${entity.username}`;
+}
+
+function telegramEntityUrl(entity: Api.Channel): string {
+  return `https://t.me/${entity.username}`;
+}
+
+function telegramPostUrl(channelSlug: string, messageId: number): string {
+  return `https://t.me/${channelSlug}/${messageId}`;
+}
+
+function sourceKindLabel(kind: "channel" | "group"): string {
+  return kind === "group" ? "Чат" : "Канал";
+}
 
 function escapeHtml(text: string): string {
   return text
@@ -113,6 +173,184 @@ function splitPlainText(text: string, maxLength = 3800): string[] {
   }
 
   return chunks;
+}
+
+type TelegramHistoryItem = {
+  id: number;
+  groupedId?: string;
+  publishedAt?: string;
+  text: string;
+  media?: ScrapedNewsMedia;
+};
+
+function mediaExtension(type: "photo" | "video"): string {
+  return type === "video" ? "mp4" : "jpg";
+}
+
+function mediaMimeType(type: "photo" | "video"): string {
+  return type === "video" ? "video/mp4" : "image/jpeg";
+}
+
+function detectTelegramMediaType(message: {
+  photo?: unknown;
+  video?: unknown;
+  media?: Api.TypeMessageMedia;
+}): "photo" | "video" | null {
+  if (message.photo) {
+    return "photo";
+  }
+
+  if (message.video) {
+    return "video";
+  }
+
+  const media = message.media;
+  if (media instanceof Api.MessageMediaPhoto) {
+    return "photo";
+  }
+
+  if (media instanceof Api.MessageMediaDocument) {
+    const mimeType = media.document instanceof Api.Document ? media.document.mimeType ?? "" : "";
+    if (mimeType.startsWith("video/")) {
+      return "video";
+    }
+  }
+
+  return null;
+}
+
+async function extractTelegramMessageMedia(
+  client: TelegramClient,
+  message: Api.Message,
+): Promise<ScrapedNewsMedia | undefined> {
+  const type = detectTelegramMediaType(message as Api.Message & { photo?: unknown; video?: unknown });
+  if (!type) {
+    return undefined;
+  }
+
+  const downloaded = await client.downloadMedia(message);
+  if (!downloaded || typeof downloaded === "string") {
+    return undefined;
+  }
+
+  return {
+    type,
+    data: downloaded,
+    fileName: `telegram-${message.id}.${mediaExtension(type)}`,
+    mimeType: mediaMimeType(type),
+  };
+}
+
+function buildTelegramPosts(channelSlug: string, messages: TelegramHistoryItem[]): ScrapedNewsPost[] {
+  const posts: ScrapedNewsPost[] = [];
+  let groupedItems: TelegramHistoryItem[] = [];
+  let currentGroupedId: string | undefined;
+
+  const flushGroup = () => {
+    if (groupedItems.length === 0) {
+      return;
+    }
+
+    const first = groupedItems[0];
+    const text = groupedItems.map((item) => item.text).find((value) => value.trim()) ?? "";
+    posts.push({
+      postId: first.id,
+      postUrl: telegramPostUrl(channelSlug, first.id),
+      publishedAt: first.publishedAt,
+      text,
+      media: groupedItems.flatMap((item) => (item.media ? [item.media] : [])),
+    });
+
+    groupedItems = [];
+    currentGroupedId = undefined;
+  };
+
+  for (const item of messages) {
+    if (item.groupedId) {
+      if (currentGroupedId && currentGroupedId !== item.groupedId) {
+        flushGroup();
+      }
+
+      currentGroupedId = item.groupedId;
+      groupedItems.push(item);
+      continue;
+    }
+
+    flushGroup();
+    posts.push({
+      postId: item.id,
+      postUrl: telegramPostUrl(channelSlug, item.id),
+      publishedAt: item.publishedAt,
+      text: item.text,
+      media: item.media ? [item.media] : [],
+    });
+  }
+
+  flushGroup();
+  return posts;
+}
+
+async function fetchTelegramSourcePostsForPeriod(
+  account: TelegramAccountToken,
+  channelSlug: string,
+  start: Date,
+  end: Date,
+  options: {
+    includeMedia?: boolean;
+  } = {},
+): Promise<{ title: string; kind: "channel" | "group"; posts: ScrapedNewsPost[] }> {
+  return withTelegramAccountClient(account, async (client) => {
+    const entity = await client.getEntity(channelSlug);
+    if (!isTelegramChannelEntity(entity)) {
+      throw new Error("Источник должен быть публичным каналом или группой с username.");
+    }
+
+    const history: TelegramHistoryItem[] = [];
+    const startKey = moscowDayKey(start);
+    const endKey = moscowDayKey(end);
+    const endMs = end.getTime();
+
+    for await (const rawMessage of client.iterMessages(entity, {
+      limit: rangeFetchLimit(start, end),
+      offsetDate: Math.floor((endMs + 1000) / 1000),
+    })) {
+      const message = rawMessage as Api.Message & {
+        groupedId?: bigint;
+        video?: unknown;
+      };
+
+      if (!message.id || !message.date) {
+        continue;
+      }
+
+      const publishedAt = new Date(message.date * 1000).toISOString();
+      const publishedKey = moscowDayKey(new Date(publishedAt));
+
+      if (publishedKey < startKey) {
+        break;
+      }
+
+      if (publishedKey > endKey) {
+        continue;
+      }
+
+      history.push({
+        id: message.id,
+        groupedId: message.groupedId?.toString(),
+        publishedAt,
+        text: message.message?.trim() ?? "",
+        media: options.includeMedia ? await extractTelegramMessageMedia(client, message) : undefined,
+      });
+    }
+
+    history.sort((left, right) => left.id - right.id);
+
+    return {
+      title: telegramEntityTitle(entity),
+      kind: telegramEntityKind(entity),
+      posts: buildTelegramPosts(channelSlug, history),
+    };
+  });
 }
 
 export function normalizeTelegramChannelInput(input: string): { channelSlug: string; url: string; feedUrl: string } {
@@ -268,6 +506,126 @@ export async function scrapePublicTelegramChannel(channelSlug: string): Promise<
   };
 }
 
+async function resolveTelegramSourceInfo(
+  account: TelegramAccountToken,
+  channelSlug: string,
+): Promise<{ title: string; kind: "channel" | "group"; latestPostId?: number }> {
+  return withTelegramAccountClient(account, async (client) => {
+    const entity = await client.getEntity(channelSlug);
+    if (!isTelegramChannelEntity(entity)) {
+      throw new Error("Нужен публичный канал или группа с username.");
+    }
+
+    let latestPostId: number | undefined;
+    for await (const rawMessage of client.iterMessages(entity, { limit: 1 })) {
+      const message = rawMessage as { id?: number };
+      if (message.id) {
+        latestPostId = message.id;
+        break;
+      }
+    }
+
+    return {
+      title: telegramEntityTitle(entity),
+      kind: telegramEntityKind(entity),
+      latestPostId,
+    };
+  });
+}
+
+async function fetchTelegramSourcePosts(
+  account: TelegramAccountToken,
+  channelSlug: string,
+  lastPostId?: number,
+  options: {
+    includeMedia?: boolean;
+  } = {},
+): Promise<{ title: string; kind: "channel" | "group"; posts: ScrapedNewsPost[] }> {
+  return withTelegramAccountClient(account, async (client) => {
+    const entity = await client.getEntity(channelSlug);
+    if (!isTelegramChannelEntity(entity)) {
+      throw new Error("Источник должен быть публичным каналом или группой с username.");
+    }
+
+    const history: TelegramHistoryItem[] = [];
+    for await (const rawMessage of client.iterMessages(entity, {
+      limit: FETCH_LIMIT,
+      minId: lastPostId ?? 0,
+      reverse: true,
+    })) {
+      const message = rawMessage as Api.Message & {
+        groupedId?: bigint;
+        video?: unknown;
+      };
+
+      if (!message.id) {
+        continue;
+      }
+
+      history.push({
+        id: message.id,
+        groupedId: message.groupedId?.toString(),
+        publishedAt: message.date ? new Date(message.date * 1000).toISOString() : undefined,
+        text: message.message?.trim() ?? "",
+        media: options.includeMedia ? await extractTelegramMessageMedia(client, message) : undefined,
+      });
+    }
+
+    return {
+      title: telegramEntityTitle(entity),
+      kind: telegramEntityKind(entity),
+      posts: buildTelegramPosts(channelSlug, history),
+    };
+  });
+}
+
+function dedupeSuggestions(items: NewsSourceSuggestion[]): NewsSourceSuggestion[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (seen.has(item.channelSlug)) {
+      return false;
+    }
+
+    seen.add(item.channelSlug);
+    return true;
+  });
+}
+
+export async function searchTelegramNewsSources(
+  telegramId: string,
+  query: string,
+): Promise<NewsSourceSuggestion[]> {
+  const normalizedQuery = query.trim();
+  if (!normalizedQuery) {
+    throw new Error("Пришли поисковый запрос, например: Донецк, ДНР или вода.");
+  }
+
+  const user = await getUser(telegramId);
+  if (!user?.telegramAccount) {
+    throw new Error("Сначала подключи Telegram-аккаунт кнопкой «Подключить Telegram».");
+  }
+
+  return withTelegramAccountClient(user.telegramAccount, async (client) => {
+    const found = await client.invoke(
+      new Api.contacts.Search({
+        q: normalizedQuery,
+        limit: SEARCH_LIMIT,
+      }),
+    );
+
+    const suggestions = found.chats
+      .filter(isTelegramChannelEntity)
+      .map((chat) => ({
+        channelSlug: chat.username!,
+        title: telegramEntityTitle(chat),
+        url: telegramEntityUrl(chat),
+        kind: telegramEntityKind(chat),
+      }));
+
+    return dedupeSuggestions(suggestions).slice(0, SEARCH_LIMIT);
+  });
+}
+
 function formatPostHeader(source: NewsSourceRecord, post: ScrapedNewsPost): string {
   return [`<b>${escapeHtml(source.title || `@${source.channelSlug}`)}</b>`, `<a href="${post.postUrl}">${escapeHtml(formatNewsDate(post.publishedAt))}</a>`].join(
     "\n",
@@ -295,6 +653,22 @@ function buildMediaCaption(source: NewsSourceRecord, post: ScrapedNewsPost): { c
     caption: header,
     sendTextAfter: true,
   };
+}
+
+function telegramMediaInput(item: ScrapedNewsMedia): string | { filename: string; data: Uint8Array; mimeType?: string } {
+  if (item.data && item.fileName) {
+    return {
+      filename: item.fileName,
+      data: item.data,
+      mimeType: item.mimeType,
+    };
+  }
+
+  if (item.url) {
+    return item.url;
+  }
+
+  throw new Error("Media item has neither URL nor uploaded file.");
 }
 
 async function sendPostText(chatId: string, source: NewsSourceRecord, post: ScrapedNewsPost, includeHeader = true): Promise<number> {
@@ -335,12 +709,12 @@ async function sendPostMedia(chatId: string, source: NewsSourceRecord, post: Scr
   if (media.length === 1) {
     const item = media[0];
     if (item.type === "photo") {
-      await sendTelegramPhoto(chatId, item.url, {
+      await sendTelegramPhoto(chatId, telegramMediaInput(item), {
         caption,
         parseMode: "HTML",
       });
     } else {
-      await sendTelegramVideo(chatId, item.url, {
+      await sendTelegramVideo(chatId, telegramMediaInput(item), {
         caption,
         parseMode: "HTML",
       });
@@ -355,7 +729,7 @@ async function sendPostMedia(chatId: string, source: NewsSourceRecord, post: Scr
         chatId,
         group.map((item, index) => ({
           type: item.type,
-          media: item.url,
+          media: telegramMediaInput(item),
           caption: groupIndex === 0 && index === 0 ? caption : undefined,
           parse_mode: groupIndex === 0 && index === 0 ? "HTML" : undefined,
         })),
@@ -387,26 +761,44 @@ export async function addPublicNewsSource(telegramId: string, input: string): Pr
   const normalized = normalizeTelegramChannelInput(input);
   await upsertUser(telegramId, (current) => ({ ...current }));
 
-  const scraped = await scrapePublicTelegramChannel(normalized.channelSlug);
-  const latestPostId = scraped.posts.at(-1)?.postId;
+  const user = await getUser(telegramId);
+  let title: string | undefined;
+  let latestPostId: number | undefined;
+  let sourceKind: "channel" | "group" = "channel";
+
+  if (user?.telegramAccount) {
+    try {
+      const resolved = await resolveTelegramSourceInfo(user.telegramAccount, normalized.channelSlug);
+      title = resolved.title;
+      latestPostId = resolved.latestPostId;
+      sourceKind = resolved.kind;
+    } catch (error) {
+      console.error(`Telegram API source resolve failed for ${normalized.channelSlug}:`, error);
+    }
+  }
+
+  if (!title) {
+    const scraped = await scrapePublicTelegramChannel(normalized.channelSlug);
+    title = scraped.title;
+    latestPostId = scraped.posts.at(-1)?.postId;
+  }
 
   const saved = await upsertNewsSource({
     telegramId,
     url: normalized.url,
     channelSlug: normalized.channelSlug,
-    title: scraped.title,
+    title,
     lastPostId: latestPostId,
     lastCheckedAt: new Date().toISOString(),
     enabled: true,
   });
 
-  return [
-    `Источник добавлен: ${saved.title ?? `@${saved.channelSlug}`}.`,
-    `Ссылка: ${saved.url}`,
-    latestPostId
-      ? "Текущие посты пропущены. Дальше бот будет присылать только новые."
-      : "Постов пока не нашлось. Когда они появятся, бот начнет присылать новые.",
-  ].join("\n");
+  const intro = `${sourceKindLabel(sourceKind)} добавлен: ${saved.title ?? `@${saved.channelSlug}`}.`;
+  const statusLine = latestPostId
+    ? "Текущие сообщения пропущены. Дальше бот будет присылать только новые."
+    : "Пока сообщений не нашлось. Когда они появятся, бот начнет присылать новые.";
+
+  return [intro, `Ссылка: ${saved.url}`, statusLine].join("\n");
 }
 
 export async function processPublicNews(telegramId?: string): Promise<{
@@ -421,6 +813,45 @@ export async function processPublicNews(telegramId?: string): Promise<{
 
   for (const source of sources) {
     try {
+      const owner = await getUser(source.telegramId);
+
+      if (owner?.telegramAccount) {
+        try {
+          const fetched = await fetchTelegramSourcePosts(owner.telegramAccount, source.channelSlug, source.lastPostId, {
+            includeMedia: true,
+          });
+          const latestPostId = fetched.posts.at(-1)?.postId ?? source.lastPostId;
+
+          checked += 1;
+          newPosts += fetched.posts.length;
+
+          if (fetched.posts.length > 0) {
+            const hydratedSource = {
+              ...source,
+              title: fetched.title ?? source.title,
+            };
+
+            for (const post of fetched.posts) {
+              deliveries += await sendFullNewsPost(hydratedSource, post);
+              try {
+                await recordIncidentFromNewsPost(hydratedSource, post);
+              } catch (error) {
+                console.error(`Incident extraction failed for ${source.channelSlug}/${post.postId}:`, error);
+              }
+            }
+          }
+
+          await updateNewsSource(source.id, {
+            title: fetched.title ?? source.title,
+            lastPostId: latestPostId,
+            lastCheckedAt: new Date().toISOString(),
+          });
+          continue;
+        } catch (error) {
+          console.error(`Telegram API polling failed for ${source.channelSlug}, fallback to web:`, error);
+        }
+      }
+
       const scraped = await scrapePublicTelegramChannel(source.channelSlug);
       const latestPostId = scraped.posts.at(-1)?.postId ?? source.lastPostId;
       const freshPosts = scraped.posts.filter((post) => post.postId > (source.lastPostId ?? 0));
@@ -436,6 +867,11 @@ export async function processPublicNews(telegramId?: string): Promise<{
 
         for (const post of freshPosts) {
           deliveries += await sendFullNewsPost(hydratedSource, post);
+          try {
+            await recordIncidentFromNewsPost(hydratedSource, post);
+          } catch (error) {
+            console.error(`Incident extraction failed for ${source.channelSlug}/${post.postId}:`, error);
+          }
         }
       }
 
@@ -457,5 +893,71 @@ export async function processPublicNews(telegramId?: string): Promise<{
     checked,
     newPosts,
     deliveries,
+  };
+}
+
+export async function refreshWaterIncidentMap(
+  telegramId: string,
+  start: Date,
+  end: Date,
+): Promise<{
+  checked: number;
+  scannedPosts: number;
+  waterSignals: number;
+  incidents: number;
+}> {
+  const sources = await listActiveNewsSources(telegramId);
+  let checked = 0;
+  let scannedPosts = 0;
+  let waterSignals = 0;
+  let incidents = 0;
+
+  for (const source of sources) {
+    try {
+      const owner = await getUser(source.telegramId);
+      let posts: ScrapedNewsPost[] = [];
+
+      if (owner?.telegramAccount) {
+        try {
+          const fetched = await fetchTelegramSourcePostsForPeriod(owner.telegramAccount, source.channelSlug, start, end, {
+            includeMedia: false,
+          });
+          posts = fetched.posts;
+        } catch (error) {
+          console.error(`Telegram API period polling failed for ${source.channelSlug}, fallback to web:`, error);
+        }
+      }
+
+      if (posts.length === 0) {
+        const scraped = await scrapePublicTelegramChannel(source.channelSlug);
+        posts = scraped.posts.filter((post) => {
+          return isPublishedWithinMoscowRange(post.publishedAt, start, end);
+        });
+      }
+
+      checked += 1;
+      scannedPosts += posts.length;
+
+      for (const post of posts) {
+        if (hasWaterIncidentSignal(post.text)) {
+          waterSignals += 1;
+        }
+
+        const incidentRecords = await recordIncidentFromNewsPost(source, post);
+        if (incidentRecords.length > 0) {
+          incidents += incidentRecords.length;
+        }
+      }
+    } catch (error) {
+      checked += 1;
+      console.error(`Map refresh failed for ${source.channelSlug}:`, error);
+    }
+  }
+
+  return {
+    checked,
+    scannedPosts,
+    waterSignals,
+    incidents,
   };
 }

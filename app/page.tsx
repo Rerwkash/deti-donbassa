@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 export default function HomePage() {
   return (
     <main className="shell">
@@ -16,7 +18,13 @@ export default function HomePage() {
             <li>Синхронизировать события сразу в оба календаря.</li>
             <li>Напоминать в день воды и просить отметить реальное начало и окончание.</li>
             <li>Использовать отмеченное время для следующих уведомлений и календарей.</li>
+            <li>Собирать сообщения о проблемах с водой и складывать их на карту по адресам.</li>
           </ul>
+          <p>
+            <Link href="/map" className="map-link">
+              Открыть карту инцидентов
+            </Link>
+          </p>
         </div>
       </section>
     </main>

@@ -1,8 +1,20 @@
 import { env } from "@/lib/env";
 import { refreshGoogleToken, replaceGoogleWaterEvents } from "@/lib/google";
+import { parseWaterIncident, parseWaterIncidents, recordIncidentFromText } from "@/lib/incidents";
 import { refreshMicrosoftToken, replaceWaterEvents } from "@/lib/microsoft";
-import { addPublicNewsSource, normalizeTelegramChannelInput, processPublicNews } from "@/lib/news";
+import {
+  addPublicNewsSource,
+  normalizeTelegramChannelInput,
+  processPublicNews,
+  refreshWaterIncidentMap,
+  searchTelegramNewsSources,
+} from "@/lib/news";
 import { getUser, listNewsSources, removeNewsSource, upsertUser } from "@/lib/storage";
+import {
+  completeTelegramLoginWithCode,
+  completeTelegramLoginWithPassword,
+  sendTelegramLoginCode,
+} from "@/lib/telegram-user";
 import { answerCallbackQuery, sendTelegramMessage } from "@/lib/telegram";
 import { BotState, GoogleToken, MicrosoftToken, TelegramUpdate, UserRecord } from "@/lib/types";
 import {
@@ -17,6 +29,8 @@ import {
 } from "@/lib/water";
 
 const BUTTONS = {
+  loginTelegram: "Подключить Telegram",
+  sharePhone: "Отправить мой номер",
   help: "Помощь",
   loginMicrosoft: "Подключить Microsoft",
   loginGoogle: "Подключить Google",
@@ -46,6 +60,13 @@ const MONTHS = [
 
 const INTERVALS = [1, 2, 3, 4, 5, 7, 10, 14, 30] as const;
 
+type SharedNewsSourceCandidate = {
+  channelSlug: string;
+  title: string;
+  kind: "channel" | "group";
+  url: string;
+};
+
 function microsoftAuthLink(telegramId: string): string {
   return `${env.APP_URL}/api/auth/microsoft/start?telegramId=${encodeURIComponent(telegramId)}`;
 }
@@ -59,6 +80,7 @@ function mainMenuKeyboard() {
     keyboard: [
       [{ text: BUTTONS.sync }, { text: BUTTONS.status }],
       [{ text: BUTTONS.loginMicrosoft }, { text: BUTTONS.loginGoogle }],
+      [{ text: BUTTONS.loginTelegram }],
       [{ text: BUTTONS.setupWater }, { text: BUTTONS.setupNews }],
       [{ text: BUTTONS.reportStart }, { text: BUTTONS.reportEnd }],
       [{ text: BUTTONS.help }],
@@ -66,6 +88,18 @@ function mainMenuKeyboard() {
     resize_keyboard: true,
     is_persistent: true,
     input_field_placeholder: "Выбери действие",
+  };
+}
+
+function telegramPhoneKeyboard() {
+  return {
+    keyboard: [
+      [{ text: BUTTONS.sharePhone, request_contact: true }],
+      [{ text: BUTTONS.cancel }],
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: true,
+    input_field_placeholder: "Отправь номер или нажми Отмена",
   };
 }
 
@@ -118,10 +152,12 @@ function newsSettingsButtons() {
   return {
     inline_keyboard: addCancelButton([
       [{ text: "Просмотр списка источников", callback_data: "news_list" }],
+      [{ text: "Подобрать источники", callback_data: "news_search_prompt" }],
       [
         { text: "Добавить", callback_data: "news_add_prompt" },
         { text: "Удалить", callback_data: "news_remove_menu" },
       ],
+      [{ text: "Обновить карту", callback_data: "map_refresh_prompt" }],
       [{ text: "Проверить сейчас", callback_data: "news_check" }],
     ]),
   };
@@ -135,14 +171,148 @@ function newsRemoveButtons(items: Array<{ title: string; channelSlug: string }>)
   };
 }
 
+function trimButtonText(text: string, maxLength = 44): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength - 1).trim()}…`;
+}
+
+function newsSuggestionButtons(
+  items: Array<{ title: string; channelSlug: string; kind: "channel" | "group" }>,
+) {
+  return {
+    inline_keyboard: addCancelButton(
+      items.map((item) => [
+        {
+          text: `${item.kind === "group" ? "Чат" : "Канал"}: ${trimButtonText(item.title, 34)}`,
+          callback_data: `news_pick:${item.channelSlug}`,
+        },
+      ]),
+    ),
+  };
+}
+
+function newsSharedSourceButtons(channelSlug: string) {
+  return {
+    inline_keyboard: [
+      [{ text: "Добавить", callback_data: `news_pick:${channelSlug}` }],
+      [{ text: BUTTONS.cancel, callback_data: "cancel_action" }],
+    ],
+  };
+}
+
+function mapMessageButtons() {
+  return {
+    inline_keyboard: [
+      [{ text: "Добавить на карту", callback_data: "map_save_pending" }],
+      [{ text: BUTTONS.cancel, callback_data: "cancel_action" }],
+    ],
+  };
+}
+
 function cancelButtons() {
   return {
     inline_keyboard: [[{ text: BUTTONS.cancel, callback_data: "cancel_action" }]],
   };
 }
 
+function sourceKindLabel(kind: "channel" | "group"): string {
+  return kind === "group" ? "чат" : "канал";
+}
+
+function findTelegramSourceInText(text: string): string | undefined {
+  const urls = text.match(/(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me)\/[^\s]+/gi) ?? [];
+  for (const url of [...urls].reverse()) {
+    try {
+      return normalizeTelegramChannelInput(url).channelSlug;
+    } catch {
+      continue;
+    }
+  }
+
+  const usernames = text.match(/(?<!\w)@[A-Za-z0-9_]{4,}(?!\w)/g) ?? [];
+  for (const username of [...usernames].reverse()) {
+    try {
+      return normalizeTelegramChannelInput(username).channelSlug;
+    } catch {
+      continue;
+    }
+  }
+
+  return undefined;
+}
+
+function extractSharedNewsSourceCandidate(
+  message?: TelegramUpdate["message"],
+  text?: string,
+): SharedNewsSourceCandidate | undefined {
+  const sharedChat = message?.chat_shared;
+  if (sharedChat?.username) {
+    return {
+      channelSlug: sharedChat.username,
+      title: sharedChat.title?.trim() || `@${sharedChat.username}`,
+      kind: sharedChat.type === "channel" ? "channel" : "group",
+      url: `https://t.me/${sharedChat.username}`,
+    };
+  }
+
+  const forwardOrigin = message?.forward_origin;
+  const originChat = forwardOrigin?.chat;
+  if (originChat?.username) {
+    return {
+      channelSlug: originChat.username,
+      title: originChat.title?.trim() || `@${originChat.username}`,
+      kind: originChat.type === "channel" ? "channel" : "group",
+      url: `https://t.me/${originChat.username}`,
+    };
+  }
+
+  const senderChat = forwardOrigin?.sender_chat;
+  if (senderChat?.username) {
+    return {
+      channelSlug: senderChat.username,
+      title: senderChat.title?.trim() || `@${senderChat.username}`,
+      kind: senderChat.type === "channel" ? "channel" : "group",
+      url: `https://t.me/${senderChat.username}`,
+    };
+  }
+
+  if (text) {
+    const channelSlug = findTelegramSourceInText(text);
+    if (channelSlug) {
+      return {
+        channelSlug,
+        title: `@${channelSlug}`,
+        kind: "channel",
+        url: `https://t.me/${channelSlug}`,
+      };
+    }
+
+    try {
+      const normalized = normalizeTelegramChannelInput(text);
+      return {
+        channelSlug: normalized.channelSlug,
+        title: `@${normalized.channelSlug}`,
+        kind: "channel",
+        url: normalized.url,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  return undefined;
+}
+
 async function sendMenuMessage(chatId: string, text: string) {
   await sendTelegramMessage(chatId, text, { replyMarkup: mainMenuKeyboard() });
+}
+
+async function sendPhoneRequestMessage(chatId: string, text: string) {
+  await sendTelegramMessage(chatId, text, { replyMarkup: telegramPhoneKeyboard() });
 }
 
 async function sendInlineMessage(chatId: string, text: string, replyMarkup: Record<string, unknown>) {
@@ -155,6 +325,26 @@ async function sendCancelablePrompt(chatId: string, text: string) {
 
 async function sendLoginMessage(chatId: string) {
   await sendInlineMessage(chatId, "Выбери календарь для подключения.", loginButtons(chatId));
+}
+
+async function startTelegramAuth(chatId: string) {
+  await upsertUser(chatId, (current) => ({
+    ...current,
+    botState: {
+      flow: "telegram_auth",
+      step: "await_phone",
+    },
+  }));
+
+  await sendPhoneRequestMessage(
+    chatId,
+    [
+      "Подключим твой Telegram-аккаунт прямо здесь.",
+      "",
+      "Нажми кнопку отправки номера ниже.",
+      "Если не хочешь использовать кнопку, можно прислать номер вручную в формате +79991234567.",
+    ].join("\n"),
+  );
 }
 
 function statusButtons() {
@@ -360,6 +550,60 @@ async function clearBotState(chatId: string) {
   }));
 }
 
+function isPhoneInput(text: string): boolean {
+  return /^\+?\d[\d\s()-]{8,18}$/.test(text.trim());
+}
+
+function isTelegramCodeInput(text: string): boolean {
+  return /^\d[\d -]{2,10}$/.test(text.trim());
+}
+
+function normalizeTelegramCode(text: string): string {
+  return text.replace(/[^\d]/g, "");
+}
+
+async function requestTelegramLoginCode(chatId: string, phoneNumber: string) {
+  const result = await sendTelegramLoginCode(phoneNumber);
+
+  await upsertUser(chatId, (current) => ({
+    ...current,
+    botState: {
+      flow: "telegram_auth",
+      step: "await_code",
+      phoneNumber: result.phoneNumber,
+      phoneCodeHash: result.phoneCodeHash,
+      pendingSession: result.pendingSession,
+      isCodeViaApp: result.isCodeViaApp,
+    },
+  }));
+
+  await sendCancelablePrompt(
+    chatId,
+    [
+      `Код отправлен на ${result.phoneNumber}.`,
+      result.isCodeViaApp
+        ? "Проверь Telegram и пришли код одним сообщением."
+        : "Проверь SMS и пришли код одним сообщением.",
+      "Пример: 12345",
+    ].join("\n"),
+  );
+}
+
+async function finishTelegramAccountConnection(chatId: string, user: UserRecord, account: UserRecord["telegramAccount"]) {
+  if (!account) {
+    throw new Error("Не удалось сохранить Telegram-аккаунт.");
+  }
+
+  await upsertUser(chatId, (current) => ({
+    ...current,
+    telegramAccount: account,
+    botState: undefined,
+  }));
+
+  const label = account.username ? `@${account.username}` : account.phoneNumber;
+  await sendMenuMessage(chatId, `Telegram-аккаунт подключен: ${account.displayName} (${label})`);
+}
+
 async function ensureFreshMicrosoftToken(telegramId: string, token: MicrosoftToken) {
   if (token.expiresAt > Date.now()) {
     return token;
@@ -455,7 +699,7 @@ async function showNewsSettings(chatId: string) {
     [
       "Настройка новостей.",
       "",
-      "Здесь можно посмотреть список источников, добавить новый публичный канал или удалить старый.",
+      "Здесь можно посмотреть список источников, подобрать новые каналы и чаты по запросу, добавить источник вручную или обновить карту за дату.",
     ].join("\n"),
     newsSettingsButtons(),
   );
@@ -473,6 +717,85 @@ async function promptNewsSourceInput(chatId: string) {
   await sendCancelablePrompt(
     chatId,
     ["Пришли ссылку на публичный Telegram-канал.", "Пример: https://t.me/durov"].join("\n"),
+  );
+}
+
+async function promptNewsSearchInput(chatId: string) {
+  await upsertUser(chatId, (current) => ({
+    ...current,
+    botState: {
+      flow: "news_setup",
+      step: "enter_news_query",
+    },
+  }));
+
+  await sendCancelablePrompt(
+    chatId,
+    [
+      "Пришли поисковый запрос, а я подберу публичные каналы и чаты.",
+      "Примеры: Донецк, ДНР, вода, новости Донбасса.",
+    ].join("\n"),
+  );
+}
+
+async function promptMapRefreshInput(chatId: string) {
+  await upsertUser(chatId, (current) => ({
+    ...current,
+    botState: {
+      flow: "news_setup",
+      step: "enter_map_range",
+    },
+  }));
+
+  await sendCancelablePrompt(
+    chatId,
+    [
+      "Пришли дату или период, за который нужно обновить карту.",
+      "Примеры: сегодня, 15.03.2026, 15.03.2026-16.03.2026.",
+    ].join("\n"),
+  );
+}
+
+async function promptSharedNewsSource(chatId: string, source: SharedNewsSourceCandidate) {
+  await clearBotState(chatId);
+  await sendInlineMessage(
+    chatId,
+    [
+      `Похоже, ты прислал ${sourceKindLabel(source.kind)}:`,
+      `${source.title}`,
+      source.url,
+      "",
+      "Добавить его в сбор новостей?",
+    ].join("\n"),
+    newsSharedSourceButtons(source.channelSlug),
+  );
+}
+
+async function promptManualMapIncident(chatId: string, text: string) {
+  const parsedItems = parseWaterIncidents(text);
+  const parsed = parsedItems[0];
+  if (!parsed?.addressText) {
+    return;
+  }
+
+  await upsertUser(chatId, (current) => ({
+    ...current,
+    botState: {
+      flow: "news_setup",
+      step: "confirm_map_message",
+      pendingIncidentText: text,
+    },
+  }));
+
+  await sendInlineMessage(
+    chatId,
+    [
+      parsedItems.length > 1
+        ? `Похоже, это сообщение о воде по адресам: ${parsedItems.map((item) => item.addressText).join(", ")}.`
+        : `Похоже, это сообщение о воде по адресу ${parsed.addressText}.`,
+      parsed.state === "restored" ? "Добавить это как восстановление на карту?" : "Добавить это как проблему на карту?",
+    ].join("\n"),
+    mapMessageButtons(),
   );
 }
 
@@ -580,6 +903,111 @@ async function handlePendingDay(chatId: string, state: BotState, text: string): 
   return true;
 }
 
+async function handlePendingTelegramPhone(chatId: string, user: UserRecord, text: string): Promise<boolean> {
+  const state = user.botState;
+  if (state?.flow !== "telegram_auth" || state.step !== "await_phone") {
+    return false;
+  }
+
+  if (!isPhoneInput(text)) {
+    await sendPhoneRequestMessage(
+      chatId,
+      [
+        "Нужен номер телефона в формате +79991234567.",
+        "Проще всего нажать кнопку отправки номера ниже.",
+      ].join("\n"),
+    );
+    return true;
+  }
+
+  try {
+    await requestTelegramLoginCode(chatId, text);
+  } catch (error) {
+    await sendPhoneRequestMessage(
+      chatId,
+      error instanceof Error ? error.message : "Не удалось запросить код. Попробуй отправить номер еще раз.",
+    );
+  }
+
+  return true;
+}
+
+async function handlePendingTelegramCode(chatId: string, user: UserRecord, text: string): Promise<boolean> {
+  const state = user.botState;
+  if (
+    state?.flow !== "telegram_auth" ||
+    state.step !== "await_code" ||
+    !state.pendingSession ||
+    !state.phoneNumber ||
+    !state.phoneCodeHash
+  ) {
+    return false;
+  }
+
+  if (!isTelegramCodeInput(text)) {
+    await sendCancelablePrompt(chatId, "Пришли код одним сообщением. Пример: 12345");
+    return true;
+  }
+
+  try {
+    const result = await completeTelegramLoginWithCode({
+      pendingSession: state.pendingSession,
+      phoneNumber: state.phoneNumber,
+      phoneCodeHash: state.phoneCodeHash,
+      phoneCode: normalizeTelegramCode(text),
+    });
+
+    if (result.status === "password_required") {
+      await upsertUser(chatId, (current) => ({
+        ...current,
+        botState: {
+          flow: "telegram_auth",
+          step: "await_password",
+          pendingSession: result.pendingSession,
+          phoneNumber: result.phoneNumber,
+        },
+      }));
+
+      await sendCancelablePrompt(chatId, "На этом аккаунте включен пароль 2FA. Пришли его следующим сообщением.");
+      return true;
+    }
+
+    await finishTelegramAccountConnection(chatId, user, result.account);
+  } catch (error) {
+    await sendCancelablePrompt(chatId, error instanceof Error ? error.message : "Код не подошел. Попробуй еще раз.");
+  }
+
+  return true;
+}
+
+async function handlePendingTelegramPassword(chatId: string, user: UserRecord, text: string): Promise<boolean> {
+  const state = user.botState;
+  if (state?.flow !== "telegram_auth" || state.step !== "await_password" || !state.pendingSession || !state.phoneNumber) {
+    return false;
+  }
+
+  if (!text.trim()) {
+    await sendCancelablePrompt(chatId, "Пароль не должен быть пустым. Пришли пароль 2FA одним сообщением.");
+    return true;
+  }
+
+  try {
+    const account = await completeTelegramLoginWithPassword({
+      pendingSession: state.pendingSession,
+      phoneNumber: state.phoneNumber,
+      password: text,
+    });
+    await finishTelegramAccountConnection(chatId, user, account);
+  } catch (error) {
+    await sendCancelablePrompt(
+      chatId,
+      error instanceof Error ? error.message : "Не удалось проверить пароль. Попробуй еще раз.",
+    );
+  }
+
+  return true;
+}
+
 async function handlePendingNewsSource(chatId: string, user: UserRecord, text: string): Promise<boolean> {
   const state = user.botState;
   if (state?.flow !== "news_setup" || state.step !== "enter_news_source") {
@@ -597,6 +1025,99 @@ async function handlePendingNewsSource(chatId: string, user: UserRecord, text: s
     );
   }
 
+  return true;
+}
+
+async function handlePendingNewsQuery(chatId: string, user: UserRecord, text: string): Promise<boolean> {
+  const state = user.botState;
+  if (state?.flow !== "news_setup" || state.step !== "enter_news_query") {
+    return false;
+  }
+
+  try {
+    const suggestions = await searchTelegramNewsSources(chatId, text);
+    if (suggestions.length === 0) {
+      await sendCancelablePrompt(
+        chatId,
+        [
+          "Ничего подходящего не нашел.",
+          "Пришли другой запрос или нажми «Отмена».",
+        ].join("\n"),
+      );
+      return true;
+    }
+
+    await clearBotState(chatId);
+    await sendInlineMessage(
+      chatId,
+      [
+        "Вот что удалось найти.",
+        "Нажми на источник, и я сразу добавлю его в сбор новостей.",
+      ].join("\n"),
+      newsSuggestionButtons(suggestions),
+    );
+  } catch (error) {
+    await sendCancelablePrompt(
+      chatId,
+      error instanceof Error
+        ? error.message
+        : "Не удалось подобрать источники. Пришли другой запрос или нажми «Отмена».",
+    );
+  }
+
+  return true;
+}
+
+async function runMapRefresh(
+  chatId: string,
+  range: {
+    start: Date;
+    end: Date;
+    label: string;
+  },
+) {
+  await sendMenuMessage(chatId, `Обновляю карту за ${range.label}. Это может занять до минуты.`);
+
+  try {
+    const result = await refreshWaterIncidentMap(chatId, range.start, range.end);
+    await sendMenuMessage(
+      chatId,
+      [
+        `Карта обновлена за ${range.label}.`,
+        `Источников проверено: ${result.checked}`,
+        `Сообщений просмотрено: ${result.scannedPosts}`,
+        `Водных сообщений найдено: ${result.waterSignals}`,
+        `Точек найдено: ${result.incidents}`,
+        "",
+        `Открыть карту: ${env.APP_URL}/map`,
+      ].join("\n"),
+    );
+  } catch (error) {
+    console.error("Map refresh failed", error);
+    await sendMenuMessage(chatId, "Не удалось обновить карту. Попробуй еще раз позже.");
+  }
+}
+
+async function handlePendingMapRefresh(chatId: string, user: UserRecord, text: string): Promise<boolean> {
+  const state = user.botState;
+  if (state?.flow !== "news_setup" || state.step !== "enter_map_range") {
+    return false;
+  }
+
+  const range = parseMapRangeInput(text);
+  if (!range) {
+    await sendCancelablePrompt(
+      chatId,
+      [
+        "Не понял дату или период.",
+        "Примеры: сегодня, 15.03.2026, 15.03.2026-16.03.2026.",
+      ].join("\n"),
+    );
+    return true;
+  }
+
+  await clearBotState(chatId);
+  await runMapRefresh(chatId, range);
   return true;
 }
 
@@ -666,6 +1187,10 @@ function normalizeAction(text: string): string {
     return "/login_google";
   }
 
+  if (trimmed === BUTTONS.loginTelegram) {
+    return "/login_telegram";
+  }
+
   if (trimmed === BUTTONS.sync) {
     return "/sync";
   }
@@ -694,7 +1219,159 @@ function normalizeAction(text: string): string {
     return "report_end";
   }
 
+  if (trimmed === BUTTONS.cancel) {
+    return "cancel";
+  }
+
   return trimmed;
+}
+
+function currentMoscowDateParts() {
+  const now = new Date();
+  const parts = moscowDateParts(now);
+
+  return {
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: Number(parts.day),
+  };
+}
+
+function moscowDateParts(date: Date) {
+  return Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Moscow",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    })
+      .formatToParts(date)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  ) as Record<"year" | "month" | "day", string>;
+}
+
+function moscowDate(year: number, month: number, day: number, endOfDay = false): Date {
+  const time = endOfDay ? "23:59:59.999" : "00:00:00.000";
+  return new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T${time}+03:00`);
+}
+
+function parseRangeDatePart(input: string, fallbackYear: number): Date | null {
+  const normalized = input.trim();
+  const match = normalized.match(/^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?$/);
+  if (!match) {
+    return null;
+  }
+
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const year = match[3] ? Number(match[3]) : fallbackYear;
+  const date = moscowDate(year, month, day);
+  const parts = moscowDateParts(date);
+  if (
+    Number.isNaN(date.getTime()) ||
+    Number(parts.year) !== year ||
+    Number(parts.month) !== month ||
+    Number(parts.day) !== day
+  ) {
+    return null;
+  }
+
+  return date;
+}
+
+function formatRangeDate(date: Date): string {
+  return new Intl.DateTimeFormat("ru-RU", {
+    timeZone: "Europe/Moscow",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  }).format(date);
+}
+
+function parseMapRangeInput(text: string): { start: Date; end: Date; label: string } | null {
+  const normalized = text.trim().toLowerCase();
+  const today = currentMoscowDateParts();
+
+  if (normalized === "сегодня") {
+    const start = moscowDate(today.year, today.month, today.day);
+    const end = moscowDate(today.year, today.month, today.day, true);
+    return { start, end, label: "сегодня" };
+  }
+
+  if (normalized === "вчера") {
+    const base = moscowDate(today.year, today.month, today.day);
+    const yesterday = new Date(base.getTime() - 86_400_000);
+    const yesterdayParts = moscowDateParts(yesterday);
+    const start = moscowDate(
+      Number(yesterdayParts.year),
+      Number(yesterdayParts.month),
+      Number(yesterdayParts.day),
+    );
+    const end = moscowDate(
+      Number(yesterdayParts.year),
+      Number(yesterdayParts.month),
+      Number(yesterdayParts.day),
+      true,
+    );
+    return { start, end, label: "вчера" };
+  }
+
+  const rangeParts = text
+    .split(/\s*[-–—]\s*/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (rangeParts.length === 1) {
+    const start = parseRangeDatePart(rangeParts[0], today.year);
+    if (!start) {
+      return null;
+    }
+
+    const startParts = moscowDateParts(start);
+    const end = moscowDate(
+      Number(startParts.year),
+      Number(startParts.month),
+      Number(startParts.day),
+      true,
+    );
+    return {
+      start,
+      end,
+      label: formatRangeDate(start),
+    };
+  }
+
+  if (rangeParts.length === 2) {
+    const right = parseRangeDatePart(rangeParts[1], today.year);
+    if (!right) {
+      return null;
+    }
+
+    const rightParts = moscowDateParts(right);
+    const left = parseRangeDatePart(rangeParts[0], Number(rightParts.year));
+    if (!left) {
+      return null;
+    }
+
+    const end = moscowDate(
+      Number(rightParts.year),
+      Number(rightParts.month),
+      Number(rightParts.day),
+      true,
+    );
+    if (left.getTime() > end.getTime()) {
+      return null;
+    }
+
+    return {
+      start: left,
+      end,
+      label: `${formatRangeDate(left)} — ${formatRangeDate(end)}`,
+    };
+  }
+
+  return null;
 }
 
 function commandPayload(text: string, command: string): string | null {
@@ -812,6 +1489,16 @@ async function handleCallbackQuery(update: TelegramUpdate): Promise<boolean> {
     return true;
   }
 
+  if (callback.data === "news_search_prompt") {
+    await promptNewsSearchInput(chatId);
+    return true;
+  }
+
+  if (callback.data === "map_refresh_prompt") {
+    await promptMapRefreshInput(chatId);
+    return true;
+  }
+
   if (callback.data === "news_remove_menu") {
     await showNewsRemoveMenu(chatId);
     return true;
@@ -826,6 +1513,48 @@ async function handleCallbackQuery(update: TelegramUpdate): Promise<boolean> {
     const channelSlug = callback.data.split(":")[1];
     await removeNewsSource(chatId, channelSlug);
     await sendMenuMessage(chatId, `Источник удален: @${channelSlug}`);
+    return true;
+  }
+
+  if (callback.data.startsWith("news_pick:")) {
+    const channelSlug = callback.data.split(":")[1];
+
+    try {
+      await sendMenuMessage(chatId, await addPublicNewsSource(chatId, `@${channelSlug}`));
+    } catch (error) {
+      await sendMenuMessage(chatId, error instanceof Error ? error.message : "Не удалось добавить источник.");
+    }
+    return true;
+  }
+
+  if (callback.data === "map_save_pending") {
+    const user = await getUser(chatId);
+    const text = user?.botState?.pendingIncidentText;
+    if (!text) {
+      await sendMenuMessage(chatId, "Не нашел сообщение для карты. Пришли его еще раз.");
+      return true;
+    }
+
+    await clearBotState(chatId);
+    const parsedItems = parseWaterIncidents(text);
+    const incident = await recordIncidentFromText(chatId, text, {
+      sourceTitle: "Добавлено вручную",
+    });
+
+    if (!incident) {
+      await sendMenuMessage(chatId, "Не удалось распознать проблему по этому сообщению.");
+      return true;
+    }
+
+    await sendMenuMessage(
+      chatId,
+      [
+        parsedItems.length > 1
+          ? `Добавлено точек: ${parsedItems.length}. Адреса: ${parsedItems.map((item) => item.addressText).join(", ")}.`
+          : `Точка добавлена: ${incident.addressText ?? "без адреса"}.`,
+        `Открыть карту: ${env.APP_URL}/map`,
+      ].join("\n"),
+    );
     return true;
   }
 
@@ -867,27 +1596,83 @@ export async function handleTelegramUpdate(update: TelegramUpdate): Promise<void
     return;
   }
 
-  const chatId = update.message?.chat?.id?.toString();
-  const rawText = update.message?.text?.trim();
+  const message = update.message;
+  const chatId = message?.chat?.id?.toString();
+  const rawText = message?.text?.trim() ?? message?.caption?.trim();
+  const contactPhone = message?.contact?.phone_number?.trim();
+  const incomingText = rawText ?? contactPhone;
 
-  if (!chatId || !rawText) {
+  if (!chatId) {
     return;
   }
 
   const user = await getUser(chatId);
-  if (user?.botState && (await handlePendingDay(chatId, user.botState, rawText))) {
+
+  if (
+    user?.botState?.flow === "telegram_auth" &&
+    user.botState.step === "await_phone" &&
+    contactPhone &&
+    message?.contact?.user_id &&
+    message?.from?.id &&
+    message.contact.user_id !== message.from.id
+  ) {
+    await sendPhoneRequestMessage(chatId, "Нужен именно твой номер. Нажми кнопку отправки номера от своего аккаунта.");
     return;
   }
 
-  if (user && (await handlePendingNewsSource(chatId, user, rawText))) {
+  if (rawText && normalizeAction(rawText) === "cancel" && user?.botState) {
+    await clearBotState(chatId);
+    await sendMenuMessage(chatId, "Действие отменено.");
     return;
   }
 
-  if (user && (await handlePendingTime(chatId, user, rawText))) {
+  if (incomingText && user && (await handlePendingTelegramPhone(chatId, user, incomingText))) {
     return;
   }
 
-  const newsAdd = commandPayload(rawText, "news_add");
+  if (incomingText && user && (await handlePendingTelegramCode(chatId, user, incomingText))) {
+    return;
+  }
+
+  if (incomingText && user && (await handlePendingTelegramPassword(chatId, user, incomingText))) {
+    return;
+  }
+
+  if (incomingText && parseWaterIncident(incomingText)) {
+    await promptManualMapIncident(chatId, incomingText);
+    return;
+  }
+
+  if (incomingText && user?.botState && (await handlePendingDay(chatId, user.botState, incomingText))) {
+    return;
+  }
+
+  if (incomingText && user && (await handlePendingNewsSource(chatId, user, incomingText))) {
+    return;
+  }
+
+  if (incomingText && user && (await handlePendingNewsQuery(chatId, user, incomingText))) {
+    return;
+  }
+
+  if (incomingText && user && (await handlePendingMapRefresh(chatId, user, incomingText))) {
+    return;
+  }
+
+  if (incomingText && user && (await handlePendingTime(chatId, user, incomingText))) {
+    return;
+  }
+
+  if (!incomingText) {
+    const sharedSource = extractSharedNewsSourceCandidate(message);
+    if (sharedSource) {
+      await promptSharedNewsSource(chatId, sharedSource);
+    }
+    return;
+  }
+
+  const textInput = normalizeAction(incomingText);
+  const newsAdd = commandPayload(incomingText, "news_add");
   if (newsAdd !== null) {
     if (!newsAdd) {
       await sendMenuMessage(chatId, "Пришли ссылку на публичный канал.\nПример: /news_add https://t.me/durov");
@@ -902,7 +1687,7 @@ export async function handleTelegramUpdate(update: TelegramUpdate): Promise<void
     return;
   }
 
-  const newsRemove = commandPayload(rawText, "news_remove");
+  const newsRemove = commandPayload(incomingText, "news_remove");
   if (newsRemove !== null) {
     if (!newsRemove) {
       await sendMenuMessage(chatId, "Пришли username или ссылку.\nПример: /news_remove https://t.me/durov");
@@ -919,17 +1704,43 @@ export async function handleTelegramUpdate(update: TelegramUpdate): Promise<void
     return;
   }
 
-  if (/^\/news_list(?:@\w+)?$/i.test(rawText)) {
+  if (/^\/news_list(?:@\w+)?$/i.test(incomingText)) {
     await sendMenuMessage(chatId, await formatNewsSourcesMessage(chatId));
     return;
   }
 
-  if (/^\/news_check(?:@\w+)?$/i.test(rawText)) {
+  if (/^\/news_check(?:@\w+)?$/i.test(incomingText)) {
     await sendMenuMessage(chatId, await checkNewsNow(chatId));
     return;
   }
 
-  const text = normalizeAction(rawText);
+  const mapUpdate = commandPayload(incomingText, "map_update");
+  if (mapUpdate !== null) {
+    if (!mapUpdate) {
+      await promptMapRefreshInput(chatId);
+      return;
+    }
+
+    const range = parseMapRangeInput(mapUpdate);
+    if (!range) {
+      await sendMenuMessage(
+        chatId,
+        "Не понял дату. Примеры: /map_update сегодня или /map_update 15.03.2026-16.03.2026",
+      );
+      return;
+    }
+
+    await runMapRefresh(chatId, range);
+    return;
+  }
+
+  const sharedSource = extractSharedNewsSourceCandidate(message, incomingText);
+  if (sharedSource) {
+    await promptSharedNewsSource(chatId, sharedSource);
+    return;
+  }
+
+  const text = textInput;
 
   if (text === "/start") {
     await sendMenuMessage(
@@ -943,6 +1754,7 @@ export async function handleTelegramUpdate(update: TelegramUpdate): Promise<void
         "3. Отмечать, когда вода реально пошла и закончилась.",
         "4. Синхронизировать оба календаря.",
         "5. Настраивать новости через кнопку «Настройка новостей».",
+        "6. Обновлять карту за дату или период.",
       ].join("\n"),
     );
     return;
@@ -950,6 +1762,11 @@ export async function handleTelegramUpdate(update: TelegramUpdate): Promise<void
 
   if (text === "/login" || text === "/login_google") {
     await sendLoginMessage(chatId);
+    return;
+  }
+
+  if (text === "/login_telegram") {
+    await startTelegramAuth(chatId);
     return;
   }
 
@@ -994,6 +1811,7 @@ export async function handleTelegramUpdate(update: TelegramUpdate): Promise<void
         "4. Выбери периодичность кнопкой.",
         "5. В день воды отмечай «Вода пошла» и «Вода закончилась».",
         "6. В «Настройка новостей» можно смотреть, добавлять и удалять источники.",
+        "7. Через «Обновить карту» можно добрать точки за сегодня, дату или период.",
         "Во время редактирования можно нажать «Отмена».",
       ].join("\n"),
     );

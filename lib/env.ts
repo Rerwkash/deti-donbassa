@@ -6,6 +6,14 @@ function required(name: string): string {
   return value;
 }
 
+function requiredNumber(name: string): number {
+  const value = Number(required(name));
+  if (!Number.isFinite(value)) {
+    throw new Error(`Environment variable ${name} must be a number`);
+  }
+  return value;
+}
+
 export const env = {
   get APP_URL() {
     return required("APP_URL");
@@ -18,6 +26,15 @@ export const env = {
   },
   get TELEGRAM_WEBHOOK_SECRET() {
     return process.env.TELEGRAM_WEBHOOK_SECRET ?? "";
+  },
+  get TELEGRAM_API_ID() {
+    return requiredNumber("TELEGRAM_API_ID");
+  },
+  get TELEGRAM_API_HASH() {
+    return required("TELEGRAM_API_HASH");
+  },
+  get TELEGRAM_SESSION_ENCRYPTION_KEY() {
+    return process.env.TELEGRAM_SESSION_ENCRYPTION_KEY ?? "";
   },
   get MICROSOFT_CLIENT_ID() {
     return required("MICROSOFT_CLIENT_ID");

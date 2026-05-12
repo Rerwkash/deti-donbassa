@@ -1,6 +1,6 @@
 # deti-donbassa
 
-Telegram bot on `Vercel` that:
+Telegram bot for `Vercel` / `Render` that:
 
 - connects Microsoft Calendar through OAuth and Graph API;
 - connects Google Calendar through OAuth and Google Calendar API;
@@ -30,6 +30,9 @@ Copy [`.env.example`](/d:/Дети донбасса/.env.example) to `.env` and 
 - `APP_SECRET`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
+- `TELEGRAM_API_ID`
+- `TELEGRAM_API_HASH`
+- `TELEGRAM_SESSION_ENCRYPTION_KEY`
 - `MICROSOFT_CLIENT_ID`
 - `MICROSOFT_CLIENT_SECRET`
 - `MICROSOFT_TENANT_ID`
@@ -38,6 +41,16 @@ Copy [`.env.example`](/d:/Дети донбасса/.env.example) to `.env` and 
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `CRON_SECRET`
+
+## Render Deploy
+
+- Push code to a supported Git provider (`GitHub`, `GitLab`, or `Bitbucket`).
+- In Render create `New +` -> `Web Service` and connect the repo.
+- Use:
+  - Build command: `npm ci && npm run build`
+  - Start command: `npm run start`
+- Add all environment variables from `.env.example`.
+- Optionally use [`render.yaml`](/d:/Дети донбасса/render.yaml) as a Blueprint starter.
 
 ## Telegram Webhook
 
@@ -69,6 +82,7 @@ If you already created the table earlier, run the new migration additions too:
 
 ```sql
 alter table public.bot_users add column if not exists google jsonb;
+alter table public.bot_users add column if not exists telegram_account jsonb;
 alter table public.bot_users add column if not exists bot_state jsonb;
 alter table public.bot_users add column if not exists notification_state jsonb;
 alter table public.news_sources add column if not exists title text;
@@ -80,12 +94,12 @@ alter table public.news_sources add column if not exists created_at timestamptz 
 
 ## External Alerts Cron
 
-`Vercel Hobby` cannot run frequent cron jobs, so use an external scheduler such as `cron-job.org`.
+Use an external scheduler such as `cron-job.org` or `Render Cron Jobs`.
 
 Call this URL every 10 minutes:
 
 ```text
-https://deti-donbassa.vercel.app/api/cron/water-alerts?token=<CRON_SECRET>
+<APP_URL>/api/cron/water-alerts?token=<CRON_SECRET>
 ```
 
 The external cron only wakes the app up. The bot itself decides whether it should send a message right now.
@@ -103,10 +117,10 @@ Commands:
 /news_remove https://t.me/durov
 ```
 
-For automatic checks call this URL from `cron-job.org` every 5-10 minutes:
+For automatic checks call this URL from your scheduler every 5-10 minutes:
 
 ```text
-https://deti-donbassa.vercel.app/api/cron/news-poll?token=<CRON_SECRET>
+<APP_URL>/api/cron/news-poll?token=<CRON_SECRET>
 ```
 
 Notes:
@@ -114,3 +128,11 @@ Notes:
 - private invite links are not supported in this mode;
 - the bot reads public `t.me/s/...` pages, so parsing can break if Telegram changes the page markup;
 - when a source is added, existing posts are skipped and only future posts are sent.
+
+## Telegram Account Session Security
+
+When you enable Telegram user-session login through the bot, the session is encrypted before saving to `Supabase`.
+
+- `TELEGRAM_SESSION_ENCRYPTION_KEY` must be set in hosting env (`Vercel` or `Render`);
+- the database stores only ciphertext for the Telegram session;
+- the app decrypts it only inside the server runtime when it needs to connect to Telegram.
